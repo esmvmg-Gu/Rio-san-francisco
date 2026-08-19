@@ -882,6 +882,7 @@ svg.leaflet-image-layer.leaflet-interactive path {
     <span id="liveLabel">Conectando con la hoja en vivo…</span>
     <button id="liveRefreshBtn" type="button" style="border:1px solid #ccc;background:#fff;border-radius:999px;padding:4px 12px;font-size:12px;cursor:pointer;">Actualizar ahora</button>
   </div>
+  <div id="liveDiag" style="font-size:11px;color:#8a8578;padding:0 4px 14px;line-height:1.6;"></div>
   <style>
     .live-dot.live-ok{background:#3f8f5f!important;box-shadow:0 0 0 rgba(63,143,95,.5);animation:liveDotPulse 2s infinite;}
     .live-dot.live-loading{background:#c9a86a!important;animation:liveDotBlink 1s infinite;}
@@ -1102,18 +1103,24 @@ const COORD = {lat:14.73933, lng:-91.15401};
   // precipitación (mm) de San Andrés Semetabaj, Concepción y Panajachel.
   async function fetchStationPrecip(){
     const result = new Map();
+    const stats = {
+      sa:{n:0, last:null}, co:{n:0, last:null}, pa:{n:0, last:null},
+      sources:[]
+    };
     for(const src of STATION_CSV_URLS){
+      const srcInfo = {year:src.year, ok:false, rawRows:0, error:null};
       try{
         const res = await fetch(src.url, {cache:"no-store"});
-        if(!res.ok) continue;
+        if(!res.ok) throw new Error("HTTP " + res.status);
         const text = await res.text();
         const parsed = Papa.parse(text, {header:true, skipEmptyLines:true});
         const fields = parsed.meta.fields || [];
+        srcInfo.rawRows = parsed.data.length;
         const fFecha = findCol(fields, ["fecha"]);
         const fHora = findCol(fields, ["hora"]);
         const fPrecip = findCol(fields, ["precipitacion (mm)","precipitacion"]);
         const fEstacion = findCol(fields, ["estacion"]);
-        if(!fFecha || !fPrecip || !fEstacion) continue;
+        if(!fFecha || !fPrecip || !fEstacion) throw new Error("No se encontraron las columnas Fecha/precipitación/ESTACION en esta hoja.");
         parsed.data.forEach(row=>{
           const estRaw = row[fEstacion];
           if(!estRaw) return;
@@ -1131,14 +1138,28 @@ const COORD = {lat:14.73933, lng:-91.15401};
           const val = num(row[fPrecip]);
           if(!result.has(epoch)) result.set(epoch, {sa:0, co:0, pa:0});
           result.get(epoch)[key] = val;
+          stats[key].n++;
+          if(stats[key].last===null || epoch > stats[key].last) stats[key].last = epoch;
         });
-      }catch(e){ console.error("station fetch failed", src.url, e); }
+        srcInfo.ok = true;
+      }catch(e){
+        srcInfo.error = e.message;
+        console.error("station fetch failed", src.url, e);
+      }
+      stats.sources.push(srcInfo);
     }
-    return result;
+    return {map:result, stats};
+  }
+
+  function fmtDMY(epoch){
+    if(epoch===null || epoch===undefined) return "sin datos";
+    const d = new Date(epoch*1000);
+    return String(d.getDate()).padStart(2,"0") + "/" + String(d.getMonth()+1).padStart(2,"0") + "/" + d.getFullYear();
   }
 
   async function refreshLiveData(manual){
     setLiveStatus("loading", manual ? "Actualizando…" : "Sincronizando…");
+    const diagEl = document.getElementById("liveDiag");
     try{
       const res = await fetch(LIVE_CSV_URL, {cache:"no-store"});
       if(!res.ok) throw new Error("HTTP " + res.status);
@@ -1148,16 +1169,32 @@ const COORD = {lat:14.73933, lng:-91.15401};
       const rows = parseCsvRowsToRiverFormat(parsed.data, fields);
       if(!rows.length) throw new Error("La hoja no tiene filas legibles.");
 
+      const alturaLast = rows[rows.length-1][0];
+      let diagLines = [`Altura (en vivo): ${rows.length.toLocaleString("es-GT")} filas · última: ${fmtDMY(alturaLast)}`];
+
       // Cruzar con la precipitación de las 3 estaciones por fecha/hora exacta
       try{
-        const precipMap = await fetchStationPrecip();
+        const { map:precipMap, stats } = await fetchStationPrecip();
         if(precipMap.size){
           rows.forEach(r=>{
             const p = precipMap.get(r[0]);
             if(p){ r[3] = p.sa; r[4] = p.co; r[5] = p.pa; }
           });
         }
-      }catch(e){ console.error("no se pudo cruzar precipitación de estaciones", e); }
+        diagLines.push(
+          `San Andrés: ${stats.sa.n.toLocaleString("es-GT")} filas · última: ${fmtDMY(stats.sa.last)}`,
+          `Concepción: ${stats.co.n.toLocaleString("es-GT")} filas · última: ${fmtDMY(stats.co.last)}`,
+          `Panajachel: ${stats.pa.n.toLocaleString("es-GT")} filas · última: ${fmtDMY(stats.pa.last)}`
+        );
+        stats.sources.forEach(s=>{
+          if(!s.ok) diagLines.push(`⚠️ Hoja Estaciones_${s.year}: ${s.error}`);
+        });
+      }catch(e){
+        console.error("no se pudo cruzar precipitación de estaciones", e);
+        diagLines.push("⚠️ No se pudo leer la precipitación de las estaciones: " + e.message);
+      }
+
+      if(diagEl) diagEl.textContent = diagLines.join("  ·  ");
 
       liveData = rows;
       updateDataCount();
@@ -1169,6 +1206,7 @@ const COORD = {lat:14.73933, lng:-91.15401};
     }catch(err){
       console.error("refreshLiveData failed", err);
       setLiveStatus("error", "Sin conexión en vivo (usando último dato disponible)");
+      if(diagEl) diagEl.textContent = "⚠️ " + err.message;
     }
   }
 
